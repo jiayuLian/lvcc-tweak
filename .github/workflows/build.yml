@@ -65,6 +65,20 @@ jobs:
 
           lipo -info out/LvccLogin.dylib
           otool -D out/LvccLogin.dylib || true
+
+          echo "=== dependency check (must NOT contain substrate) ==="
+          otool -L out/LvccLogin.dylib
+          if otool -L out/LvccLogin.dylib | grep -Eqi 'substrate|ellekit'; then
+            echo "FATAL: dylib links a hooking runtime; TrollStore devices without it will crash on launch"
+            exit 1
+          fi
+          if nm -u out/LvccLogin.dylib | grep -Eq '_MSHook|_HBLog'; then
+            echo "FATAL: undefined substrate symbols present"
+            nm -u out/LvccLogin.dylib | grep -E '_MSHook|_HBLog'
+            exit 1
+          fi
+          echo "OK: zero external hooking dependency"
+
           ldid -S out/LvccLogin.dylib
           echo "=== signature ==="
           ldid -e out/LvccLogin.dylib | head -c 200 || true
