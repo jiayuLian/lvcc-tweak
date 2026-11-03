@@ -651,7 +651,8 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 - (BOOL)vcLooksLikeLogin:(UIViewController *)vc {
     if (!vc || !vc.isViewLoaded || !vc.view) return NO;
     __block BOOL hasTF = NO, hasLoginBtn = NO;
-    void (^walk)(UIView *) = ^(UIView *v) {
+    __block void (^walk)(UIView *);
+    walk = ^(UIView *v) {
         for (UIView *sub in v.subviews) {
             if ([sub isKindOfClass:[UITextField class]]) hasTF = YES;
             if ([sub isKindOfClass:[UIButton class]]) {
