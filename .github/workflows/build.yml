@@ -1,0 +1,40 @@
+name: build-dylib
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          brew install ldid xz make || true
+
+      - name: Setup Theos
+        run: |
+          export THEOS="$RUNNER_TEMP/theos"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          make clean || true
+          make FINALPACKAGE=1 ARCHS="arm64 arm64e" 2>&1 | tail -50
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          find .theos -name "*.dylib" -type f -exec cp {} out/ \;
+          ls -la out
+          for f in out/*.dylib; do lipo -info "$f" || true; ldid -S "$f" || true; done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LvccLogin
+          path: out/*.dylib
