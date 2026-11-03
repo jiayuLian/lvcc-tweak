@@ -647,24 +647,25 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     }
 }
 
+// 递归扫描视图：是否含输入框 + 登录类按钮
+static void LVCCScanView(UIView *v, BOOL *hasTF, BOOL *hasLoginBtn) {
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UITextField class]]) *hasTF = YES;
+        if ([sub isKindOfClass:[UIButton class]]) {
+            NSString *t = [((UIButton *)sub) titleForState:UIControlStateNormal];
+            if (t && ([t containsString:@"登录"] || [t containsString:@"手机号"] ||
+                     [t containsString:@"微信"] || [t containsString:@"Apple"] ||
+                     [t containsString:@"验证码"])) *hasLoginBtn = YES;
+        }
+        LVCCScanView(sub, hasTF, hasLoginBtn);
+    }
+}
+
 // 判断某个 VC 的视图是否像「登录页」：有输入框 + 有登录/手机号/微信/Apple 按钮
 - (BOOL)vcLooksLikeLogin:(UIViewController *)vc {
     if (!vc || !vc.isViewLoaded || !vc.view) return NO;
-    __block BOOL hasTF = NO, hasLoginBtn = NO;
-    __block void (^walk)(UIView *);
-    walk = ^(UIView *v) {
-        for (UIView *sub in v.subviews) {
-            if ([sub isKindOfClass:[UITextField class]]) hasTF = YES;
-            if ([sub isKindOfClass:[UIButton class]]) {
-                NSString *t = [((UIButton *)sub) titleForState:UIControlStateNormal];
-                if (t && ([t containsString:@"登录"] || [t containsString:@"手机号"] ||
-                         [t containsString:@"微信"] || [t containsString:@"Apple"] ||
-                         [t containsString:@"验证码"])) hasLoginBtn = YES;
-            }
-            walk(sub);
-        }
-    };
-    walk(vc.view);
+    BOOL hasTF = NO, hasLoginBtn = NO;
+    LVCCScanView(vc.view, &hasTF, &hasLoginBtn);
     return hasTF && hasLoginBtn;
 }
 
