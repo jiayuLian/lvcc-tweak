@@ -7,6 +7,8 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    permissions:
+      contents: write   # 允许 gh release 创建/删除 release 与 tag
     steps:
       - uses: actions/checkout@v4
 
