@@ -343,20 +343,31 @@ static void WriteUserModelFile(NSDictionary *data) {
                         // 2b) NSKeyedArchiver 归档：用 App 自己的类解码，KVC 改字段后重新归档
                         if (!wrote) {
                             @try {
-                                id root = [NSKeyedUnarchiver unarchiveTopLevelObjectWithData:existing];
+                                NSError *err = nil;
+                                NSKeyedUnarchiver *ua = [[NSKeyedUnarchiver alloc] initForReadingFromData:existing
+                                                                       error:&err];
+                                ua.requiresSecureCoding = NO;
+                                id root = nil;
+                                if (ua) {
+                                    root = [ua decodeTopLevelObjectForKey:NSKeyedArchiveRootObjectKey error:&err];
+                                    [ua finishDecoding];
+                                }
                                 if (root) {
                                     if (ut.length)  { @try { [root setValue:ut  forKey:@"userToken"]; } @catch (NSException *e) {} }
                                     if (rt.length)  { @try { [root setValue:rt  forKey:@"refreshToken"]; } @catch (NSException *e) {} }
                                     if (uid.length) { @try { [root setValue:uid forKey:@"userId"]; } @catch (NSException *e) {} }
                                     if (mob.length) { @try { [root setValue:mob forKey:@"mobile"]; } @catch (NSException *e) {} }
-                                    NSError *e = nil;
-                                    NSData *arc = [NSKeyedArchiver archivedDataWithRootObject:root
-                                                            requiringSecureCoding:NO error:&e];
+                                    NSKeyedArchiver *ka = [[NSKeyedArchiver alloc] initRequiringSecureCoding:NO];
+                                    [ka encodeRootObject:root];
+                                    NSData *arc = [ka encodedData];
+                                    [ka finishEncoding];
                                     if (arc && [arc writeToFile:p atomically:YES]) { fmt = @"nskeyed-archive"; wrote = YES; }
-                                    else LG(@"!!! UserModel 归档写回失败 %@ : %@", p, e.localizedDescription);
+                                    else LG(@"!!! UserModel 归档写回失败 %@ : 编码为 nil", p);
+                                } else {
+                                    LG(@"!!! UserModel NSKeyedUnarchiver 解码为 nil %@ : %@", p, err.localizedDescription);
                                 }
                             } @catch (NSException *ex) {
-                                LG(@"!!! UserModel NSKeyedUnarchiver 解码失败 %@ : %@", p, ex.reason);
+                                LG(@"!!! UserModel NSKeyed 解码异常 %@ : %@", p, ex.reason);
                             }
                         }
                     }
