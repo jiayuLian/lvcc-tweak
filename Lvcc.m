@@ -1,4 +1,4 @@
-// LvccLogin v0.6.0 —— 零依赖版本（无 Substrate / 无 logos / 无 MSHook）
+// LvccLogin v0.8.0 —— 零依赖版本（无 Substrate / 无 logos / 无 MSHook）
 // 目标：iOS 15.4.1 / arm64 / TrollStore + TrollFools
 //
 // 行为：
@@ -8,22 +8,27 @@
 //      按驴充充 App 自己的持久化方式写回：
 //        a) NSUserDefaults 一组高频键（双保险）
 //        b) 用户态文件 usermodel（逆向确认：UserManager 把 UserModel 序列化到
-//           <Documents|Library>/Charge/usermodel，App 启动即读它判定登录态）
-//      随后 exit(0) 让 App 重新启动 → 读文件 → 直接进入已登录态。
+//           <沙盒目录>/Charge/usermodel，App 启动即读它判定登录态）。
+//           v0.8 起按文件真实格式自适应（JSON / 普通 plist / NSKeyedArchiver 归档），
+//           并用 App 自己的 UserModel 类参与编解码，避免写坏。
+//      随后用 posix_spawn 干净重启 App → 读文件 → 直接进入已登录态（不再硬杀进程）。
 //   4) 长按胶囊 → 调试菜单（导出存储 / 查看日志 / 导出 usermodel 文件）。
 //
-// 关键修复（相对 v0.5.0）：
-//   - keyWindow 改从 UIWindowScene.windows 取（iOS13+ 场景化 App 下
-//     UIApplication.windows 常为空，导致按钮永不出现）。
-//   - 登录页判定改为「类名含 Login」优先（Swift/SwiftUI 页面按文字扫描会漏）。
+// 关键修复（相对 v0.7.0）：
+//   - 写回目录补上 Library/Application Support（之前漏了，导致文件写错位置 → 重进仍要登录）。
+//   - 序列化格式自适应：不再盲目按 JSON 写，避免把 NSKeyedArchiver 归档体写坏。
+//   - 重启改 posix_spawn 干净重启，消除 exit(0) 造成的「闪退」观感。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <unistd.h>
+#import <spawn.h>
+#import <string.h>
+extern char **environ;
 
-#define BUILD_TAG  @"v0.7.0-arm64-nodep"
+#define BUILD_TAG  @"v0.8.0-arm64-nodep"
 #define LOG_PATH   @"/var/mobile/Library/Caches/lvcc_tweak.log"
 #define KEYS_PATH  @"/var/mobile/Library/Caches/lvcc_token_keys.plist"
 #define API_HOST   @"appapi.lvcchong.com"
@@ -270,14 +275,22 @@ static void WriteTokens(NSDictionary *data) {
     }
 }
 
-// 逆向确认：UserManager 把 UserModel 存到 <Documents|Library>/Charge/usermodel。
-// 策略：文件存在 → 读 JSON 原位替换 token 字段（保留其它字段，避免 schema 不匹配）；
-//       文件不存在 → 仅在最可能的两个路径按已知字段创建。
+// 逆向确认：UserManager 把 UserModel 存到 <某沙盒目录>/Charge/usermodel。
+// 关键修复：
+//   1) 搜索目录补上 Library/Application Support（App 用户数据最常用目录，之前漏了）。
+//   2) 序列化格式自适应：文件存在时先探测真实格式——
+//        - JSON 文本 → 把服务端返回的整个 data 原位合并（含 userToken/refreshToken/userId/mobile 等全部字段），保留其它字段；
+//        - 二进制 plist（bplist00）→ 原样用 NSKeyedUnarchiver 解码（App 自己的类参与解码），
+//          用 KVC 改 userToken/refreshToken/userId/mobile 后重新归档写回；
+//        - 普通 plist 字典 → 同样合并 data 后写回。
+//   3) 文件不存在时只在最可信路径新建：先尝试用 App 自己的 UserModel 类构造并归档，
+//      失败退回 JSON（写入服务端原始 data）。同时自动创建缺失的中间目录。
 static void WriteUserModelFile(NSDictionary *data) {
     @try {
         NSArray *baseDirs = @[
             [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
             [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject],
+            [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject],
             [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject],
         ];
         NSArray *relPaths = @[@"Charge/usermodel", @"usermodel", @"Charge/userModel", @"userModel",
@@ -292,38 +305,130 @@ static void WriteUserModelFile(NSDictionary *data) {
             for (NSString *rel in relPaths) {
                 NSString *p = [base stringByAppendingPathComponent:rel];
                 NSData *existing = [NSData dataWithContentsOfFile:p options:0 error:nil];
-                NSMutableDictionary *dict = nil;
-                if (existing) {
-                    dict = [[NSJSONSerialization JSONObjectWithData:existing
-                                                           options:NSJSONReadingMutableContainers error:nil] mutableCopy];
-                }
                 BOOL exists = (existing != nil);
-                BOOL createAllowed = (!exists && ([rel isEqualToString:@"Charge/usermodel"]));
-                if (!exists && !createAllowed) continue;
 
-                if (!dict) dict = [NSMutableDictionary dictionary];
-                if (ut.length)  dict[@"userToken"] = ut;
-                if (rt.length)  dict[@"refreshToken"] = rt;
-                if (uid.length) dict[@"userId"] = uid;
-                if (mob.length) dict[@"mobile"] = mob;
-                if (data[@"setLoginPasswordFlag"] != nil) dict[@"setLoginPasswordFlag"] = data[@"setLoginPasswordFlag"];
-                if (data[@"sysUserPlatformFlag"] != nil) dict[@"sysUserPlatformFlag"] = data[@"sysUserPlatformFlag"];
-                if (data[@"identificationStatus"] != nil) dict[@"identificationStatus"] = data[@"identificationStatus"];
+                if (exists) {
+                    // ---- 探测真实格式并原位更新 ----
+                    NSString *fmt = @"?";
+                    BOOL wrote = NO;
 
-                NSError *err = nil;
-                NSData *out = [NSJSONSerialization dataWithJSONObject:dict
-                                                            options:NSJSONWritingPrettyPrinted error:&err];
-                if (out) {
-                    [out writeToFile:p atomically:YES];
-                    LG(@"已写 UserModel 文件(%@): %@", exists ? @"原位改" : @"新建", p);
+                    // 1) JSON
+                    if (!wrote) {
+                        @try {
+                            NSMutableDictionary *m = [[NSJSONSerialization JSONObjectWithData:existing
+                                                options:NSJSONReadingMutableContainers error:nil] mutableCopy];
+                            if ([m isKindOfClass:[NSMutableDictionary class]]) {
+                                [m addEntriesFromDictionary:data];   // 整包覆盖服务端返回字段，保留其余
+                                NSError *e = nil;
+                                NSData *out = [NSJSONSerialization dataWithJSONObject:m
+                                                        options:NSJSONWritingPrettyPrinted error:&e];
+                                if (out && [out writeToFile:p atomically:YES]) { fmt = @"JSON"; wrote = YES; }
+                                else LG(@"!!! UserModel JSON 写回失败 %@ : %@", p, e.localizedDescription);
+                            }
+                        } @catch (NSException *ex) { }
+                    }
+
+                    // 2) 二进制 plist（可能是 NSKeyedArchiver 归档体，也可能是普通 plist）
+                    if (!wrote && existing.length >= 8 && memcmp(existing.bytes, "bplist00", 8) == 0) {
+                        // 2a) 普通 plist 字典
+                        @try {
+                            NSMutableDictionary *m = [[NSPropertyListSerialization
+                                propertyListWithData:existing options:NSPropertyListMutableContainers
+                                format:nil error:nil] mutableCopy];
+                            if ([m isKindOfClass:[NSMutableDictionary class]]) {
+                                [m addEntriesFromDictionary:data];
+                                if ([m writeToFile:p atomically:YES]) { fmt = @"plist-dict"; wrote = YES; }
+                            }
+                        } @catch (NSException *ex) { }
+                        // 2b) NSKeyedArchiver 归档：用 App 自己的类解码，KVC 改字段后重新归档
+                        if (!wrote) {
+                            @try {
+                                id root = [NSKeyedUnarchiver unarchiveTopLevelObjectWithData:existing];
+                                if (root) {
+                                    if (ut.length)  { @try { [root setValue:ut  forKey:@"userToken"]; } @catch (NSException *e) {} }
+                                    if (rt.length)  { @try { [root setValue:rt  forKey:@"refreshToken"]; } @catch (NSException *e) {} }
+                                    if (uid.length) { @try { [root setValue:uid forKey:@"userId"]; } @catch (NSException *e) {} }
+                                    if (mob.length) { @try { [root setValue:mob forKey:@"mobile"]; } @catch (NSException *e) {} }
+                                    NSError *e = nil;
+                                    NSData *arc = [NSKeyedArchiver archivedDataWithRootObject:root
+                                                            requiringSecureCoding:NO error:&e];
+                                    if (arc && [arc writeToFile:p atomically:YES]) { fmt = @"nskeyed-archive"; wrote = YES; }
+                                    else LG(@"!!! UserModel 归档写回失败 %@ : %@", p, e.localizedDescription);
+                                }
+                            } @catch (NSException *ex) {
+                                LG(@"!!! UserModel NSKeyedUnarchiver 解码失败 %@ : %@", p, ex.reason);
+                            }
+                        }
+                    }
+
+                    if (wrote) LG(@"已更新 UserModel 文件(格式=%@): %@", fmt, p);
+                    else      LG(@"!!! UserModel 文件格式无法识别，跳过: %@", p);
+
                 } else {
-                    LG(@"!!! UserModel 序列化失败 %@ : %@", p, err.localizedDescription);
+                    // ---- 文件不存在：只在最可信路径新建 ----
+                    if (![rel isEqualToString:@"Charge/usermodel"]) continue;
+
+                    // 确保中间目录存在
+                    NSString *dir = [p stringByDeletingLastPathComponent];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                             withIntermediateDirectories:YES attributes:nil error:nil];
+
+                    BOOL wrote = NO;
+                    // 尝试用 App 自己的 UserModel 类构造并归档
+                    Class umCls = NSClassFromString(@"_TtC6Charge9UserModel");
+                    if (umCls) {
+                        @try {
+                            id model = [[umCls alloc] init];
+                            if (model) {
+                                if (ut.length)  { @try { [model setValue:ut  forKey:@"userToken"]; } @catch (NSException *e) {} }
+                                if (rt.length)  { @try { [model setValue:rt  forKey:@"refreshToken"]; } @catch (NSException *e) {} }
+                                if (uid.length) { @try { [model setValue:uid forKey:@"userId"]; } @catch (NSException *e) {} }
+                                if (mob.length) { @try { [model setValue:mob forKey:@"mobile"]; } @catch (NSException *e) {} }
+                                NSError *e = nil;
+                                NSData *arc = [NSKeyedArchiver archivedDataWithRootObject:model
+                                                                 requiringSecureCoding:NO error:&e];
+                                if (arc && [arc writeToFile:p atomically:YES]) { wrote = YES; LG(@"已新建 UserModel(用App类归档): %@", p); }
+                            }
+                        } @catch (NSException *ex) { }
+                    }
+                    // 退回：直接写服务端返回的 JSON
+                    if (!wrote) {
+                        @try {
+                            NSError *e = nil;
+                            NSData *out = [NSJSONSerialization dataWithJSONObject:data
+                                                            options:NSJSONWritingPrettyPrinted error:&e];
+                            if (out && [out writeToFile:p atomically:YES]) {
+                                wrote = YES;
+                                LG(@"已新建 UserModel(JSON回退): %@", p);
+                            } else LG(@"!!! UserModel JSON 新建失败 %@ : %@", p, e.localizedDescription);
+                        } @catch (NSException *ex) { }
+                    }
                 }
             }
         }
     } @catch (NSException *e) {
         LG(@"!!! WriteUserModelFile 异常: %@", e.reason);
     }
+}
+
+// 干净重启 App：用 posix_spawn 拉起当前可执行文件的新实例，再退出当前进程。
+// 这样不会触发系统「已关闭」的崩溃报告，用户看到的是正常重启而非闪退。
+static void RelaunchApp(void) {
+    @try {
+        NSString *exe = [[NSBundle mainBundle] executablePath];
+        if (!exe.length) { LG(@"!!! 取不到可执行路径，退回 exit"); exit(0); }
+        pid_t pid = 0;
+        char *args[] = { (char *)[exe UTF8String], NULL };
+        int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, args, environ);
+        if (rc == 0) {
+            LG(@"posix_spawn 新实例 pid=%d，准备退出当前进程", (int)pid);
+        } else {
+            LG(@"!!! posix_spawn 失败 rc=%d，退回 exit", rc);
+        }
+    } @catch (NSException *e) {
+        LG(@"!!! RelaunchApp 异常: %@", e.reason);
+    }
+    exit(0);
 }
 
 // 在候选路径里找已存在的 usermodel 文件，返回内容字符串
@@ -333,6 +438,7 @@ static NSString *ReadUserModelFiles(void) {
         NSArray *baseDirs = @[
             [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
             [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject],
+            [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject],
             [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject],
         ];
         NSArray *relPaths = @[@"Charge/usermodel", @"usermodel", @"Charge/userModel", @"userModel",
@@ -346,7 +452,28 @@ static NSString *ReadUserModelFiles(void) {
                 if (!d) continue;
                 found = YES;
                 [out appendFormat:@"\n--- %@ ---\n", p];
-                NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"<binary>";
+                NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                if (!s) {
+                    // 二进制 plist（可能是 NSKeyedArchiver 归档）：尽量转成可读字典
+                    @try {
+                        id pl = [NSPropertyListSerialization propertyListWithData:d
+                                    options:NSPropertyListImmutable format:nil error:nil];
+                        if ([pl isKindOfClass:[NSDictionary class]]) {
+                            NSMutableString *ms = [NSMutableString string];
+                            for (NSString *k in pl) {
+                                id v = pl[k];
+                                NSString *vs = [v isKindOfClass:[NSString class]] ? v : [v description];
+                                if (vs.length > 300) vs = [[vs substringToIndex:300] stringByAppendingString:@"…(截断)"];
+                                [ms appendFormat:@"  %@ = %@%@\n", k, vs, ClassifyValue(v)];
+                            }
+                            s = ms;
+                        } else {
+                            s = [NSString stringWithFormat:@"<二进制 plist，类型 %@>", NSStringFromClass([pl class])];
+                        }
+                    } @catch (NSException *e) {
+                        s = @"<二进制，无法解析>";
+                    }
+                }
                 if (s.length > 4000) s = [[s substringToIndex:4000] stringByAppendingString:@"…(截断)"];
                 [out appendString:s];
             }
@@ -740,9 +867,9 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
         [t2.centerXAnchor constraintEqualToAnchor:g.centerXAnchor],
     ]];
 
-    LG(@"登录成功，1.4s 后 exit 让 App 重新读取凭证");
+    LG(@"登录成功，1.4s 后干净重启 App 重新读取凭证");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        exit(0);
+        RelaunchApp();
     });
 }
 
