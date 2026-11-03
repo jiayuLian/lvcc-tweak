@@ -402,7 +402,19 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
 // ---------------- 登录卡 UI ----------------
 
-@class LvccPanel;   // 下方定义，供 onCancel/onDimTap 调用 dismissLogin
+// LvccPanel 接口前置，让 LvccLoginVC 能直接调用 dismissLogin（避免 forward declaration 调方法报错）
+@interface LvccPanel : NSObject
+@property (nonatomic, strong) UIWindow *pillWindow;
+@property (nonatomic, strong) UIWindow *loginWindow;
+@property (nonatomic, strong) UIButton *pill;
+@property (nonatomic, weak)   UIViewController *hostVC;
+@property (nonatomic, copy)   NSString *lastText;
++ (instancetype)shared;
+- (void)installPill;
+- (void)startVisibilityMonitor;
+- (void)copyLastText;
+- (void)dismissLogin;
+@end
 
 @interface LvccLoginVC : UIViewController
 @property (nonatomic, weak)   LvccPanel *panel;
@@ -737,19 +749,6 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 @end
 
 // ---------------- 胶囊按钮 + 面板 ----------------
-
-@interface LvccPanel : NSObject
-@property (nonatomic, strong) UIWindow *pillWindow;
-@property (nonatomic, strong) UIWindow *loginWindow;   // 承载登录卡的全屏窗口（层级高于胶囊）
-@property (nonatomic, strong) UIButton *pill;
-@property (nonatomic, weak)   UIViewController *hostVC;
-@property (nonatomic, copy)   NSString *lastText;
-+ (instancetype)shared;
-- (void)installPill;
-- (void)startVisibilityMonitor;
-- (void)copyLastText;
-- (void)dismissLogin;
-@end
 
 @implementation LvccPanel
 
