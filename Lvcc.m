@@ -1,16 +1,21 @@
-// LvccLogin v0.5.0 —— 零依赖版本（无 Substrate / 无 logos / 无 MSHook）
+// LvccLogin v0.6.0 —— 零依赖版本（无 Substrate / 无 logos / 无 MSHook）
 // 目标：iOS 15.4.1 / arm64 / TrollStore + TrollFools
 //
 // 行为：
 //   1) 注入后自动在「登录页」底部浮出一枚橙色胶囊按钮「密码登录」。
 //   2) 点按 → 弹出登录卡（手机号 + 密码 + 确定）。
 //   3) 确定 → 调密码登录接口(sub=5) 拿到 userToken / refreshToken / userId，
-//      原样写回 App 的 NSUserDefaults / Keychain（键名用「启动时扫描 + 运行时 hook」
-//      两种方式动态学习，无需知道 App 内部字段名），随后重启 App 进入已登录态。
-//   4) 长按胶囊 → 调试菜单（导出存储 / 查看日志），便于校准凭证键。
+//      按驴充充 App 自己的持久化方式写回：
+//        a) NSUserDefaults 一组高频键（双保险）
+//        b) 用户态文件 usermodel（逆向确认：UserManager 把 UserModel 序列化到
+//           <Documents|Library>/Charge/usermodel，App 启动即读它判定登录态）
+//      随后 exit(0) 让 App 重新启动 → 读文件 → 直接进入已登录态。
+//   4) 长按胶囊 → 调试菜单（导出存储 / 查看日志 / 导出 usermodel 文件）。
 //
-// 为什么不是悬浮球 + 弹窗式输入：用户要的是登录页上一个能点的按钮，
-// 所以改用跟随登录页显隐的小窗胶囊，并配自定义登录卡 UI。
+// 关键修复（相对 v0.5.0）：
+//   - keyWindow 改从 UIWindowScene.windows 取（iOS13+ 场景化 App 下
+//     UIApplication.windows 常为空，导致按钮永不出现）。
+//   - 登录页判定改为「类名含 Login」优先（Swift/SwiftUI 页面按文字扫描会漏）。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -18,7 +23,7 @@
 #import <objc/runtime.h>
 #import <unistd.h>
 
-#define BUILD_TAG  @"v0.5.0-arm64-nodep"
+#define BUILD_TAG  @"v0.6.0-arm64-nodep"
 #define LOG_PATH   @"/var/mobile/Library/Caches/lvcc_tweak.log"
 #define KEYS_PATH  @"/var/mobile/Library/Caches/lvcc_token_keys.plist"
 #define API_HOST   @"appapi.lvcchong.com"
@@ -106,11 +111,6 @@ static NSString *ClassifyValue(id v) {
 }
 
 // ---------------- 凭证键自动学习 ----------------
-// 目标：不需要逆 App 就能知道它把 token 存在哪个 NSUserDefaults 键 / Keychain 项里。
-// 方法一：注入时扫描当前存储里已经存在的 token 值，记下它的键名（值过期没关系，键名稳定）。
-// 方法二：hook NSUserDefaults setObject:forKey:，App 自己写 token 时顺手记下键名。
-//        这样即便用户此前已登出（键被删），只要他之后做过一次原生验证码登录，
-//        我们也能学到正确的键，下次密码登录直接写回去。
 
 static NSMutableSet   *gNdKeys;   // NSUserDefaults 键名集合
 static NSMutableArray *gKcItems;  // Keychain 项：@{@"service":, @"account":}
@@ -129,14 +129,12 @@ static void LoadKeys(void) {
     gNdKeys = [NSMutableSet set];
     gKcItems = [NSMutableArray array];
 
-    // 1) 读持久化
     @try {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:KEYS_PATH];
         if (d[@"nd"]) [gNdKeys addObjectsFromArray:d[@"nd"]];
         if (d[@"kc"]) [gKcItems addObjectsFromArray:d[@"kc"]];
     } @catch (NSException *e) { }
 
-    // 2) 扫描当前 NSUserDefaults 中已存在的 token 值 → 记键名
     @try {
         NSDictionary *all = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
         for (NSString *k in all) {
@@ -146,7 +144,6 @@ static void LoadKeys(void) {
         }
     } @catch (NSException *e) { }
 
-    // 3) 扫描 Keychain 中已存在的 token 值 → 记 service/account
     @try {
         NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
                              (__bridge id)kSecClassInternetPassword];
@@ -178,7 +175,6 @@ static void LoadKeys(void) {
     LG(@"已学习凭证键: NSUserDefaults=%lu  Keychain=%lu", (unsigned long)gNdKeys.count, (unsigned long)gKcItems.count);
 }
 
-// hook NSUserDefaults setObject:forKey:（直接替换 IMP，零依赖）
 static void (*gOrigSetObject)(id, SEL, id, id) = NULL;
 static void LVCCSetObject(id self, SEL _cmd, id value, id key) {
     @try {
@@ -202,34 +198,34 @@ static void InstallSetHook(void) {
     } @catch (NSException *e) { }
 }
 
-// 把登录拿到的凭证写回 App 本地存储，键名用学到的 + 一组高频默认键（双保险）
+// 把登录拿到的凭证写回 App 本地存储
 static void WriteTokens(NSDictionary *data) {
     @try {
         NSString *ut  = [data[@"userToken"]   description] ?: @"";
         NSString *rt  = [data[@"refreshToken"] description] ?: @"";
         NSString *uid = [data[@"userId"]      description] ?: @"";
+        NSString *mob = [data[@"mobile"]      description] ?: @"";
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 
         // 高频默认键（绝大多数 App 用这几个名字）
         if (ut.length)  { [ud setObject:ut forKey:@"userToken"]; [ud setObject:ut forKey:@"token"];       [ud setObject:ut forKey:@"accessToken"]; }
         if (rt.length)  { [ud setObject:rt forKey:@"refreshToken"]; }
         if (uid.length) { [ud setObject:uid forKey:@"userId"]; [ud setObject:uid forKey:@"uid"]; }
-        if (data[@"mobile"]) [ud setObject:data[@"mobile"] forKey:@"mobile"];
+        if (mob.length) { [ud setObject:mob forKey:@"mobile"]; }
 
-        // 学到的键：根据原值的形态决定写 userToken 还是 refreshToken
+        // 学到的键：根据原值形态决定写 userToken 还是 refreshToken
         for (NSString *k in gNdKeys) {
             id cur = [ud objectForKey:k];
             NSString *cs = [cur isKindOfClass:[NSString class]] ? cur : nil;
             if (cs.length >= 32) {
                 if (JWTBody(cs)) {
-                    if (ut.length) [ud setObject:ut forKey:k];          // 原值就是 JWT → 写新的 userToken(JWT)
+                    if (ut.length) [ud setObject:ut forKey:k];
                 } else {
-                    [ud setObject:(rt.length ? rt : ut) forKey:k];     // 原值是长串(多为 refresh) → 写 refresh
+                    [ud setObject:(rt.length ? rt : ut) forKey:k];
                 }
             }
         }
 
-        // 整个 data 当作用户对象写回，覆盖按对象读取的 App
         @try {
             NSData *jd = [NSJSONSerialization dataWithJSONObject:data options:0 error:nil];
             NSString *js = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
@@ -243,7 +239,7 @@ static void WriteTokens(NSDictionary *data) {
 
         [ud synchronize];
 
-        // 学到的 Keychain 项：用 userToken 更新数据
+        // Keychain 学到的项
         NSData *val = [ut dataUsingEncoding:NSUTF8StringEncoding] ?: [rt dataUsingEncoding:NSUTF8StringEncoding];
         for (NSDictionary *it in gKcItems) {
             if (!val.length) break;
@@ -263,10 +259,102 @@ static void WriteTokens(NSDictionary *data) {
                 SecItemAdd((__bridge CFDictionaryRef)add, NULL);
             }
         }
+
+        // ★核心：写回 App 自己的用户态文件（UserManager 把 UserModel 序列化到这里）
+        WriteUserModelFile(data);
+
         LG(@"凭证已写回：ND键=%lu  KC项=%lu  userToken.len=%lu", (unsigned long)gNdKeys.count, (unsigned long)gKcItems.count, (unsigned long)ut.length);
     } @catch (NSException *e) {
         LG(@"!!! WriteTokens 异常: %@", e.reason);
     }
+}
+
+// 逆向确认：UserManager 把 UserModel 存到 <Documents|Library>/Charge/usermodel。
+// 策略：文件存在 → 读 JSON 原位替换 token 字段（保留其它字段，避免 schema 不匹配）；
+//       文件不存在 → 仅在最可能的两个路径按已知字段创建。
+static void WriteUserModelFile(NSDictionary *data) {
+    @try {
+        NSArray *baseDirs = @[
+            [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
+            [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject],
+            [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject],
+        ];
+        NSArray *relPaths = @[@"Charge/usermodel", @"usermodel", @"Charge/userModel", @"userModel",
+                             @"Charge/UserModel", @"UserModel"];
+        NSString *ut  = [data[@"userToken"]   description] ?: @"";
+        NSString *rt  = [data[@"refreshToken"] description] ?: @"";
+        NSString *uid = [data[@"userId"]      description] ?: @"";
+        NSString *mob = [data[@"mobile"]      description] ?: @"";
+
+        for (NSString *base in baseDirs) {
+            if (![base length]) continue;
+            for (NSString *rel in relPaths) {
+                NSString *p = [base stringByAppendingPathComponent:rel];
+                NSData *existing = [NSData dataWithContentsOfFile:p options:0 error:nil];
+                NSMutableDictionary *dict = nil;
+                if (existing) {
+                    dict = [[NSJSONSerialization JSONObjectWithData:existing
+                                                           options:NSJSONReadingMutableContainers error:nil] mutableCopy];
+                }
+                BOOL exists = (existing != nil);
+                BOOL createAllowed = (!exists && ([rel isEqualToString:@"Charge/usermodel"]));
+                if (!exists && !createAllowed) continue;
+
+                if (!dict) dict = [NSMutableDictionary dictionary];
+                if (ut.length)  dict[@"userToken"] = ut;
+                if (rt.length)  dict[@"refreshToken"] = rt;
+                if (uid.length) dict[@"userId"] = uid;
+                if (mob.length) dict[@"mobile"] = mob;
+                if (data[@"setLoginPasswordFlag"] != nil) dict[@"setLoginPasswordFlag"] = data[@"setLoginPasswordFlag"];
+                if (data[@"sysUserPlatformFlag"] != nil) dict[@"sysUserPlatformFlag"] = data[@"sysUserPlatformFlag"];
+                if (data[@"identificationStatus"] != nil) dict[@"identificationStatus"] = data[@"identificationStatus"];
+
+                NSError *err = nil;
+                NSData *out = [NSJSONSerialization dataWithJSONObject:dict
+                                                            options:NSJSONWritingPrettyPrinted error:&err];
+                if (out) {
+                    [out writeToFile:p atomically:YES];
+                    LG(@"已写 UserModel 文件(%@): %@", exists ? @"原位改" : @"新建", p);
+                } else {
+                    LG(@"!!! UserModel 序列化失败 %@ : %@", p, err.localizedDescription);
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        LG(@"!!! WriteUserModelFile 异常: %@", e.reason);
+    }
+}
+
+// 在候选路径里找已存在的 usermodel 文件，返回内容字符串
+static NSString *ReadUserModelFiles(void) {
+    NSMutableString *out = [NSMutableString string];
+    @try {
+        NSArray *baseDirs = @[
+            [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
+            [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject],
+            [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject],
+        ];
+        NSArray *relPaths = @[@"Charge/usermodel", @"usermodel", @"Charge/userModel", @"userModel",
+                             @"Charge/UserModel", @"UserModel"];
+        BOOL found = NO;
+        for (NSString *base in baseDirs) {
+            if (![base length]) continue;
+            for (NSString *rel in relPaths) {
+                NSString *p = [base stringByAppendingPathComponent:rel];
+                NSData *d = [NSData dataWithContentsOfFile:p options:0 error:nil];
+                if (!d) continue;
+                found = YES;
+                [out appendFormat:@"\n--- %@ ---\n", p];
+                NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"<binary>";
+                if (s.length > 4000) s = [[s substringToIndex:4000] stringByAppendingString:@"…(截断)"];
+                [out appendString:s];
+            }
+        }
+        if (!found) [out appendString:@"（未在任何候选路径找到 usermodel 文件——说明当前为登出态且尚未创建）"];
+    } @catch (NSException *e) {
+        [out appendFormat:@"\n读取异常: %@", e.reason];
+    }
+    return out;
 }
 
 // ---------------- HTTP ----------------
@@ -329,7 +417,6 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
 
-    // 点击暗色背景才关闭（卡片内部不触发）
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onDimTap:)];
     tap.cancelsTouchesInView = NO;
     [self.view addGestureRecognizer:tap];
@@ -344,7 +431,6 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     card.userInteractionEnabled = YES;
     [self.view addSubview:card];
 
-    // 顶部渐变标题条
     UIView *header = [[UIView alloc] init];
     header.translatesAutoresizingMaskIntoConstraints = NO;
     header.layer.cornerRadius = 18;
@@ -447,7 +533,6 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
         [cancel.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
     ]];
 
-    // 让渐变层跟随 header 尺寸
     dispatch_async(dispatch_get_main_queue(), ^{
         gl.frame = header.bounds;
     });
@@ -482,7 +567,7 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
 - (void)onDimTap:(UITapGestureRecognizer *)g {
     CGPoint p = [g locationInView:self.view];
-    if (self.cardView && CGRectContainsPoint(self.cardView.frame, p)) return; // 点在卡片内不关闭
+    if (self.cardView && CGRectContainsPoint(self.cardView.frame, p)) return;
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
@@ -584,7 +669,7 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
     LG(@"登录成功，1.4s 后 exit 让 App 重新读取凭证");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        exit(0);   // 干净退出，App 重新启动后读取写回的凭证 → 直接进入已登录态
+        exit(0);
     });
 }
 
@@ -627,13 +712,26 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     return nil;
 }
 
+// ★修复：iOS13+ 场景化 App 下 UIApplication.windows 常为空，
+//   必须从 UIWindowScene.windows 取 keyWindow，否则按钮/弹窗全失效。
 - (UIWindow *)keyWindow {
     @try {
+        UIWindowScene *scene = [self activeScene];
+        if (scene) {
+            for (UIWindow *w in scene.windows) {
+                if (w.isKeyWindow) return w;
+            }
+            for (UIWindow *w in scene.windows) {
+                if (w.rootViewController) return w;
+            }
+            if (scene.windows.firstObject) return scene.windows.firstObject;
+        }
         for (UIWindow *w in UIApplication.sharedApplication.windows) {
             if (w.isKeyWindow) return w;
         }
+        return UIApplication.sharedApplication.windows.firstObject;
     } @catch (NSException *e) { }
-    return UIApplication.sharedApplication.windows.firstObject;
+    return nil;
 }
 
 - (UIViewController *)topVC {
@@ -647,23 +745,35 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     }
 }
 
-// 递归扫描视图：是否含输入框 + 登录类按钮
+// 递归扫描视图：是否含输入框 + 登录类按钮（含 attributedTitle）
 static void LVCCScanView(UIView *v, BOOL *hasTF, BOOL *hasLoginBtn) {
     for (UIView *sub in v.subviews) {
-        if ([sub isKindOfClass:[UITextField class]]) *hasTF = YES;
+        if ([sub isKindOfClass:[UITextField class]] || [sub isKindOfClass:[UITextView class]]) *hasTF = YES;
         if ([sub isKindOfClass:[UIButton class]]) {
-            NSString *t = [((UIButton *)sub) titleForState:UIControlStateNormal];
+            UIButton *b = (UIButton *)sub;
+            NSString *t = [b titleForState:UIControlStateNormal];
+            if (!t) t = [b titleForState:UIControlStateSelected];
+            if (!t) {
+                NSAttributedString *at = [b attributedTitleForState:UIControlStateNormal];
+                if (!at) at = [b attributedTitleForState:UIControlStateSelected];
+                t = at.string;
+            }
             if (t && ([t containsString:@"登录"] || [t containsString:@"手机号"] ||
                      [t containsString:@"微信"] || [t containsString:@"Apple"] ||
-                     [t containsString:@"验证码"])) *hasLoginBtn = YES;
+                     [t containsString:@"验证码"] || [t containsString:@"注册"])) *hasLoginBtn = YES;
         }
         LVCCScanView(sub, hasTF, hasLoginBtn);
     }
 }
 
-// 判断某个 VC 的视图是否像「登录页」：有输入框 + 有登录/手机号/微信/Apple 按钮
-- (BOOL)vcLooksLikeLogin:(UIViewController *)vc {
-    if (!vc || !vc.isViewLoaded || !vc.view) return NO;
+// 判定 VC 是否为登录页：
+//   优先按类名含 "Login"（Swift/SwiftUI 页面按文字扫描会漏，最稳）；
+//   其次回退到「有输入框 + 登录类按钮」的视图扫描。
+static BOOL VCLooksLikeLogin(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *cn = NSStringFromClass([vc class]);
+    if ([cn rangeOfString:@"Login" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    if (!vc.isViewLoaded || !vc.view) return NO;
     BOOL hasTF = NO, hasLoginBtn = NO;
     LVCCScanView(vc.view, &hasTF, &hasLoginBtn);
     return hasTF && hasLoginBtn;
@@ -678,7 +788,7 @@ static void LVCCScanView(UIView *v, BOOL *hasTF, BOOL *hasLoginBtn) {
         while (stack.count) {
             UIViewController *vc = stack.lastObject;
             [stack removeLastObject];
-            if ([self vcLooksLikeLogin:vc]) return vc;
+            if (VCLooksLikeLogin(vc)) return vc;
             [stack addObjectsFromArray:vc.childViewControllers];
             if (vc.presentedViewController) [stack addObject:vc.presentedViewController];
         }
@@ -694,16 +804,15 @@ static void LVCCScanView(UIView *v, BOOL *hasTF, BOOL *hasLoginBtn) {
             UIWindowScene *scene = [self activeScene];
             UIWindow *w = scene ? [[UIWindow alloc] initWithWindowScene:scene]
                                 : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-            // 小窗只覆盖底部胶囊区域，不挡住 App 自身按钮
             CGRect sr = UIScreen.mainScreen.bounds;
             CGFloat ww = 200, wh = 84;
             w.frame = CGRectMake((sr.size.width - ww) / 2.0,
-                                 sr.size.height - wh - 30, ww, wh);
+                                 sr.size.height - wh - 40, ww, wh);
             w.windowLevel = UIWindowLevelAlert + 1000;
             w.backgroundColor = [UIColor clearColor];
             w.rootViewController = [[UIViewController alloc] init];
             w.rootViewController.view.backgroundColor = [UIColor clearColor];
-            w.hidden = YES;   // 默认隐藏，登录页出现才显示
+            w.hidden = YES;
             w.alpha = 0;
             self.pillWindow = w;
 
@@ -748,7 +857,6 @@ static void LVCCScanView(UIView *v, BOOL *hasTF, BOOL *hasLoginBtn) {
 }
 
 - (void)startVisibilityMonitor {
-    // 每 1.2s 检测登录页是否存在，存在则渐显胶囊，否则隐藏
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(tickVisibility) object:nil];
     [self performSelector:@selector(tickVisibility) withObject:nil afterDelay:1.2];
 }
@@ -790,6 +898,13 @@ static void LVCCScanView(UIView *v, BOOL *hasTF, BOOL *hasLoginBtn) {
         [ac addAction:[UIAlertAction actionWithTitle:@"导出存储（定位凭证键）"
                                                style:UIAlertActionStyleDefault
                                              handler:^(UIAlertAction *a) { [self dumpStorage]; }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"导出 usermodel 文件"
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            NSString *s = ReadUserModelFiles();
+            LG(@"==== usermodel 文件 ====%@", s);
+            [self showText:s title:@"usermodel 文件内容"];
+        }]];
         [ac addAction:[UIAlertAction actionWithTitle:@"查看日志" style:UIAlertActionStyleDefault
                                              handler:^(UIAlertAction *a) {
             [self showText:ReadLogTail(200 * 1024) title:@"日志（末尾 200KB）"];
@@ -938,6 +1053,9 @@ static void LVCCScanView(UIView *v, BOOL *hasTF, BOOL *hasLoginBtn) {
     [out appendFormat:@"NSUserDefaults: %@\n", [gNdKeys allObjects]];
     [out appendFormat:@"Keychain: %@\n", gKcItems];
 
+    [out appendString:@"\n===== usermodel 文件 =====\n"];
+    [out appendString:ReadUserModelFiles()];
+
     LG(@"==== dump 开始 ====");
     LG(@"%@", out.length > 8000 ? [out substringToIndex:8000] : out);
     LG(@"==== dump 结束 ====");
@@ -958,8 +1076,8 @@ static void lvcc_init(void) {
             LG(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
             LG(@"home=%@", NSHomeDirectory());
 
-            LoadKeys();        // 先学凭证键（读已有值 + 加载持久化）
-            InstallSetHook();  // 再 hook setObject，运行时持续学习
+            LoadKeys();
+            InstallSetHook();
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
