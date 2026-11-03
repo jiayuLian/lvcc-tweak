@@ -18,6 +18,10 @@
 //   - 写回目录补上 Library/Application Support（之前漏了，导致文件写错位置 → 重进仍要登录）。
 //   - 序列化格式自适应：不再盲目按 JSON 写，避免把 NSKeyedArchiver 归档体写坏。
 //   - 重启改 posix_spawn 干净重启，消除 exit(0) 造成的「闪退」观感。
+//
+// 关键修复（相对 v0.8.0）：
+//   - 长按调试菜单不再用系统 ActionSheet（半透明遮罩会把登录页底部图标/协议文字透出来显得乱），
+//     改为自有全屏不透明遮罩窗口承载菜单与文本查看器，彻底盖住登录页，消除错乱。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -28,7 +32,7 @@
 #import <string.h>
 extern char **environ;
 
-#define BUILD_TAG  @"v0.8.0-arm64-nodep"
+#define BUILD_TAG  @"v0.9.1-arm64-nodep"
 #define LOG_PATH   @"/var/mobile/Library/Caches/lvcc_tweak.log"
 #define KEYS_PATH  @"/var/mobile/Library/Caches/lvcc_token_keys.plist"
 #define API_HOST   @"appapi.lvcchong.com"
@@ -205,32 +209,56 @@ static void InstallSetHook(void) {
 
 // 把登录拿到的凭证写回 App 本地存储
 static void WriteUserModelFile(NSDictionary *data);   // 前向声明（定义在下方）
+
+// 服务端不同登录分支下发的字段名不统一（微信分支可能给 token/accessToken 而非 userToken）。
+// 任一命中即取，避免整组凭证被写空——导出存储实锤 App 读 userToken/token/accessToken 三键同值。
+static NSString *PickStr(NSDictionary *d, NSArray *keys) {
+    for (NSString *k in keys) {
+        id v = d[k];
+        if (!v || v == [NSNull null]) continue;
+        if (![v isKindOfClass:[NSString class]] && ![v isKindOfClass:[NSNumber class]]) continue;
+        NSString *s = [v description];
+        if (s.length) return s;
+    }
+    return @"";
+}
+
 static void WriteTokens(NSDictionary *data) {
     @try {
-        NSString *ut  = [data[@"userToken"]   description] ?: @"";
-        NSString *rt  = [data[@"refreshToken"] description] ?: @"";
-        NSString *uid = [data[@"userId"]      description] ?: @"";
-        NSString *mob = [data[@"mobile"]      description] ?: @"";
+        NSString *ut  = PickStr(data, @[@"userToken", @"token", @"accessToken", @"access_token"]);
+        NSString *rt  = PickStr(data, @[@"refreshToken", @"refresh_token"]);
+        NSString *uid = PickStr(data, @[@"userId", @"uid", @"user_id"]);
+        NSString *mob = PickStr(data, @[@"mobile", @"phone", @"tel"]);
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 
-        // 高频默认键（绝大多数 App 用这几个名字）
+        // 导出存储实锤：App 登录态 = 下面这 7 个键，userToken/token/accessToken 必须同值。
         if (ut.length)  { [ud setObject:ut forKey:@"userToken"]; [ud setObject:ut forKey:@"token"];       [ud setObject:ut forKey:@"accessToken"]; }
         if (rt.length)  { [ud setObject:rt forKey:@"refreshToken"]; }
         if (uid.length) { [ud setObject:uid forKey:@"userId"]; [ud setObject:uid forKey:@"uid"]; }
         if (mob.length) { [ud setObject:mob forKey:@"mobile"]; }
 
-        // 学到的键：根据原值形态决定写 userToken 还是 refreshToken
-        for (NSString *k in gNdKeys) {
-            id cur = [ud objectForKey:k];
-            NSString *cs = [cur isKindOfClass:[NSString class]] ? cur : nil;
-            if (cs.length >= 32) {
-                if (JWTBody(cs)) {
-                    if (ut.length) [ud setObject:ut forKey:k];
-                } else {
-                    [ud setObject:(rt.length ? rt : ut) forKey:k];
-                }
-            }
+        // App 按 uid_日期 记录登录设备标记，缺失时部分版本会判为「异常设备」要求重登。
+        if (uid.length) {
+            NSDateFormatter *df = [[NSDateFormatter alloc] init];
+            [df setDateFormat:@"yyyy-MM-dd"];
+            [df setLocale:[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]];
+            [ud setObject:[NSString stringWithFormat:@"%@_%@", uid, [df stringFromDate:[NSDate date]]]
+                   forKey:@"recordLoginDeviceFlag"];
         }
+
+        LG(@"凭证写回明细: data.keys=%@ | userToken.len=%lu refreshToken.len=%lu userId=%@ mobile=%@",
+           [data.allKeys componentsJoinedByString:@","],
+           (unsigned long)ut.length, (unsigned long)rt.length, uid, mob);
+
+        // 关键：白名单 7 键写完立刻刷盘。下面 userInfo/Keychain/usermodel 都是兜底逻辑，
+        // data 里若含 NSNull 或非 plist 对象，setObject: 会抛异常被外层 @catch 吞掉；
+        // 把 synchronize 放最后的话，异常会让凭证停留在内存里，手动杀后台时全部丢失。
+        [ud synchronize];
+
+        // v0.9.1：删掉「学到的键」盲写循环。导出存储 140 个键里大量是 TuringShield / 友盟 /
+        // OpenUDID 等设备指纹，长度 >=32 会被 ClassifyValue 误判成「疑似凭证」，旧逻辑把它们
+        // 全部覆写成 JWT，直接写坏 SDK 缓存 → App 冷启动风控异常 / 判定未登录。
+        // 登录态只认上面写死的 7 个白名单键，不再靠「学习」猜。
 
         @try {
             NSData *jd = [NSJSONSerialization dataWithJSONObject:data options:0 error:nil];
@@ -243,7 +271,7 @@ static void WriteTokens(NSDictionary *data) {
             }
         } @catch (NSException *e) { }
 
-        [ud synchronize];
+        // 凭证已在上文刷盘；此处不再重复 synchronize。
 
         // Keychain 学到的项
         NSData *val = [ut dataUsingEncoding:NSUTF8StringEncoding] ?: [rt dataUsingEncoding:NSUTF8StringEncoding];
@@ -266,8 +294,11 @@ static void WriteTokens(NSDictionary *data) {
             }
         }
 
-        // ★核心：写回 App 自己的用户态文件（UserManager 把 UserModel 序列化到这里）
-        WriteUserModelFile(data);
+        // v0.9.1：不再写 usermodel 文件。导出实证该文件只有
+        //   {"identificationStatus":1,"isInScreenAd":false}
+        // 两个 UI 标志，根本不是凭证载体（v0.6~v0.8 一直往它写 token 是方向性错误）。
+        // 往里合并服务端全字段还有被 App 的 Codable 严格解码拒绝的风险，索性原样不动。
+        // WriteUserModelFile() 定义保留供导出/诊断，但登录流程不再调用。
 
         LG(@"凭证已写回：ND键=%lu  KC项=%lu  userToken.len=%lu", (unsigned long)gNdKeys.count, (unsigned long)gKcItems.count, (unsigned long)ut.length);
     } @catch (NSException *e) {
@@ -532,7 +563,7 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
         NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
         LG(@"<<< %@  status=%ld  body=%@", path,
            (long)((NSHTTPURLResponse *)resp).statusCode,
-           raw.length > 2000 ? [raw substringToIndex:2000] : raw);
+           raw.length > 12000 ? [raw substringToIndex:12000] : raw);
         cb(j);
     }];
     [t resume];
@@ -547,6 +578,8 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 @property (nonatomic, strong) UIButton *pill;
 @property (nonatomic, weak)   UIViewController *hostVC;
 @property (nonatomic, copy)   NSString *lastText;
+@property (nonatomic, strong) UIWindow *debugWindow;
+@property (nonatomic, weak)   UIView   *debugCardView;
 + (instancetype)shared;
 - (void)installPill;
 - (void)startVisibilityMonitor;
@@ -830,9 +863,12 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
                 [ws resetOK];
                 return;
             }
-            NSDictionary *d = j[@"data"] ?: @{};
+            // 防服务端把 data 下成字符串/数组：类型不对就当空，避免 allKeys 抛异常把整个回调打断。
+            NSDictionary *d = ([j[@"data"] isKindOfClass:[NSDictionary class]]) ? j[@"data"] : @{};
+            LG(@"登录响应 code=%@ success=%@ data.keys=%@",
+               j[@"code"], j[@"success"], [d.allKeys componentsJoinedByString:@","]);
             WriteTokens(d);
-            [ws showSuccessThenRelaunch];
+            [ws showSuccessThenGuide];
         });
     });
 }
@@ -842,10 +878,13 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     [self.okBtn setTitle:@"确 定" forState:UIControlStateNormal];
 }
 
-- (void)showSuccessThenRelaunch {
+- (void)showSuccessThenGuide {
     for (UIView *v in self.view.subviews) v.hidden = YES;
     self.view.backgroundColor = [UIColor systemBackgroundColor];
 
+    // v0.9.1：取消自动重启。iOS 禁止同一 bundle 双实例，posix_spawn 拉起的第二个实例会被
+    // SpringBoard 立即强杀，表现就是「点确定 → 闪退 → 重开仍停在登录页」。凭证已落盘，
+    // 交给用户手动冷启动：App 才会真正重新读一遍 NSUserDefaults，也把「重启」这个变量摘掉。
     UIImageView *check = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"checkmark.circle.fill"]];
     check.tintColor = [UIColor systemGreenColor];
     check.translatesAutoresizingMaskIntoConstraints = NO;
@@ -861,27 +900,40 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
     UILabel *t2 = [[UILabel alloc] init];
     t2.translatesAutoresizingMaskIntoConstraints = NO;
-    t2.text = @"正在重启 App 进入已登录状态…";
+    t2.text = @"凭证已写入。请立刻上划杀掉 App 后台，再重新打开即可进入已登录状态。\n（短票有效期 30 秒，别隔太久再开）";
     t2.font = [UIFont systemFontOfSize:14];
     t2.textColor = [UIColor secondaryLabelColor];
     t2.textAlignment = NSTextAlignmentCenter;
+    t2.numberOfLines = 0;
     [self.view addSubview:t2];
+
+    UIButton *rb = [UIButton buttonWithType:UIButtonTypeSystem];
+    rb.translatesAutoresizingMaskIntoConstraints = NO;
+    [rb setTitle:@"仍要自动重启（实验）" forState:UIControlStateNormal];
+    rb.titleLabel.font = [UIFont systemFontOfSize:13];
+    [rb addTarget:self action:@selector(onTryRelaunch) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:rb];
 
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [check.widthAnchor constraintEqualToConstant:72], [check.heightAnchor constraintEqualToConstant:72],
         [check.centerXAnchor constraintEqualToAnchor:g.centerXAnchor],
-        [check.centerYAnchor constraintEqualToAnchor:g.centerYAnchor constant:-30],
+        [check.centerYAnchor constraintEqualToAnchor:g.centerYAnchor constant:-60],
         [t1.topAnchor constraintEqualToAnchor:check.bottomAnchor constant:16],
         [t1.centerXAnchor constraintEqualToAnchor:g.centerXAnchor],
-        [t2.topAnchor constraintEqualToAnchor:t1.bottomAnchor constant:8],
+        [t2.topAnchor constraintEqualToAnchor:t1.bottomAnchor constant:10],
         [t2.centerXAnchor constraintEqualToAnchor:g.centerXAnchor],
+        [t2.widthAnchor constraintEqualToConstant:300],
+        [rb.topAnchor constraintEqualToAnchor:t2.bottomAnchor constant:18],
+        [rb.centerXAnchor constraintEqualToAnchor:g.centerXAnchor],
     ]];
 
-    LG(@"登录成功，1.4s 后干净重启 App 重新读取凭证");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        RelaunchApp();
-    });
+    LG(@"登录成功：凭证已写入 NSUserDefaults，等待用户手动冷启动（不自动重启，避免双实例强杀）");
+}
+
+- (void)onTryRelaunch {
+    LG(@"用户选择实验性自动重启（posix_spawn，可能被 SpringBoard 强杀）");
+    RelaunchApp();
 }
 
 @end
@@ -1108,33 +1160,7 @@ static BOOL VCLooksLikeLogin(UIViewController *vc) {
 
 - (void)onPillLong:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    @try {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"调试菜单"
-                                                                   message:BUILD_TAG
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-        [ac addAction:[UIAlertAction actionWithTitle:@"导出存储（定位凭证键）"
-                                               style:UIAlertActionStyleDefault
-                                             handler:^(UIAlertAction *a) { [self dumpStorage]; }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"导出 usermodel 文件"
-                                               style:UIAlertActionStyleDefault
-                                             handler:^(UIAlertAction *a) {
-            NSString *s = ReadUserModelFiles();
-            LG(@"==== usermodel 文件 ====%@", s);
-            [self showText:s title:@"usermodel 文件内容"];
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"查看日志" style:UIAlertActionStyleDefault
-                                             handler:^(UIAlertAction *a) {
-            [self showText:ReadLogTail(200 * 1024) title:@"日志（末尾 200KB）"];
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-        UIViewController *vc = [self topVC];
-        if (!vc) return;
-        if (ac.popoverPresentationController) {
-            ac.popoverPresentationController.sourceView = vc.view;
-            ac.popoverPresentationController.sourceRect = CGRectMake(vc.view.bounds.size.width/2, 200, 1, 1);
-        }
-        [vc presentViewController:ac animated:YES completion:nil];
-    } @catch (NSException *e) { }
+    [self showDebugMenu];
 }
 
 - (void)copyLastText {
@@ -1143,6 +1169,147 @@ static BOOL VCLooksLikeLogin(UIViewController *vc) {
             UIPasteboard.generalPasteboard.string = self.lastText;
             LG(@"已复制 %lu 字符到剪贴板", (unsigned long)self.lastText.length);
         }
+    } @catch (NSException *e) { }
+}
+
+- (UIWindow *)ensureDebugWindow {
+    @try {
+        if (self.debugWindow) return self.debugWindow;
+        UIWindowScene *scene = [self activeScene];
+        UIWindow *w = scene ? [[UIWindow alloc] initWithWindowScene:scene]
+                            : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        w.windowLevel = UIWindowLevelAlert + 3000;   // 高于登录卡窗口(+2000)，自带不透明遮罩盖住登录页 → 不再有原生元素透出造成的「错乱」
+        w.backgroundColor = [UIColor clearColor];
+        w.rootViewController = [[UIViewController alloc] init];
+        w.rootViewController.view.backgroundColor = [UIColor clearColor];
+        w.hidden = YES;
+        self.debugWindow = w;
+        return w;
+    } @catch (NSException *e) { return nil; }
+}
+
+- (void)closeDebug {
+    @try {
+        if (!self.debugWindow) return;
+        [UIView animateWithDuration:0.2 animations:^{ self.debugWindow.alpha = 0; }
+                         completion:^(BOOL f){ self.debugWindow.hidden = YES; self.debugWindow.alpha = 1; }];
+    } @catch (NSException *e) { }
+}
+
+// 长按胶囊 → 自定义全屏调试菜单（不再用系统 ActionSheet，半透明遮罩会把登录页底部图标/协议文字透出来显得乱）
+- (void)showDebugMenu {
+    @try {
+        UIWindow *w = [self ensureDebugWindow];
+        if (!w) return;
+
+        UIViewController *host = [[UIViewController alloc] init];
+        host.view.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];   // 不透明遮罩，彻底盖住登录页
+        host.modalPresentationStyle = UIModalPresentationFullScreen;
+
+        UITapGestureRecognizer *bg = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onDebugBgTap:)];
+        [host.view addGestureRecognizer:bg];
+
+        CGFloat cardW = MIN(w.bounds.size.width - 32, 320);
+        UIView *card = [[UIView alloc] init];
+        card.translatesAutoresizingMaskIntoConstraints = NO;
+        card.backgroundColor = [UIColor systemBackgroundColor];
+        card.layer.cornerRadius = 16;
+        card.userInteractionEnabled = YES;
+        [host.view addSubview:card];
+        self.debugCardView = card;
+
+        UILabel *title = [[UILabel alloc] init];
+        title.translatesAutoresizingMaskIntoConstraints = NO;
+        title.text = @"调试菜单";
+        title.font = [UIFont boldSystemFontOfSize:18];
+        title.textAlignment = NSTextAlignmentCenter;
+        [card addSubview:title];
+
+        UILabel *ver = [[UILabel alloc] init];
+        ver.translatesAutoresizingMaskIntoConstraints = NO;
+        ver.text = BUILD_TAG;
+        ver.font = [UIFont systemFontOfSize:11];
+        ver.textColor = [UIColor secondaryLabelColor];
+        ver.textAlignment = NSTextAlignmentCenter;
+        [card addSubview:ver];
+
+        NSArray *items = @[
+            @[ @"导出存储（定位凭证键）", (id)^(void){ [self dumpStorage]; } ],
+            @[ @"导出 usermodel 文件", (id)^(void){
+                NSString *s = ReadUserModelFiles();
+                LG(@"==== usermodel 文件 ====%@", s);
+                [self showText:s title:@"usermodel 文件内容"];
+            } ],
+            @[ @"查看日志", (id)^(void){ [self showText:ReadLogTail(200 * 1024) title:@"日志（末尾 200KB）"]; } ],
+        ];
+        NSMutableArray *btns = [NSMutableArray array];
+        for (NSArray *it in items) {
+            NSString *t = it[0];
+            void (^act)(void) = (void(^)(void))it[1];
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+            b.translatesAutoresizingMaskIntoConstraints = NO;
+            [b setTitle:t forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont systemFontOfSize:16];
+            b.backgroundColor = [UIColor secondarySystemBackgroundColor];
+            b.layer.cornerRadius = 10;
+            [b addTarget:self action:@selector(debugActionWrapper:) forControlEvents:UIControlEventTouchUpInside];
+            objc_setAssociatedObject(b, "lvcc_debug_act", act, OBJC_ASSOCIATION_COPY);
+            [card addSubview:b];
+            [btns addObject:b];
+        }
+
+        UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+        close.translatesAutoresizingMaskIntoConstraints = NO;
+        [close setTitle:@"关 闭" forState:UIControlStateNormal];
+        close.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+        close.backgroundColor = ORANGE;
+        [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        close.layer.cornerRadius = 10;
+        [close addTarget:self action:@selector(closeDebug) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:close];
+        [btns addObject:close];
+
+        UILayoutGuide *g = card.layoutMarginsGuide;
+        NSMutableArray *cons = [NSMutableArray arrayWithArray:@[
+            [card.centerXAnchor constraintEqualToAnchor:host.view.centerXAnchor],
+            [card.centerYAnchor constraintEqualToAnchor:host.view.centerYAnchor],
+            [card.widthAnchor constraintEqualToConstant:cardW],
+            [title.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
+            [title.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+            [title.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+            [ver.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:4],
+            [ver.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+            [ver.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+        ]];
+        UIView *prev = ver;
+        for (UIButton *b in btns) {
+            [cons addObject:[b.topAnchor constraintEqualToAnchor:prev.bottomAnchor constant:10]];
+            [cons addObject:[b.leadingAnchor constraintEqualToAnchor:g.leadingAnchor]];
+            [cons addObject:[b.trailingAnchor constraintEqualToAnchor:g.trailingAnchor]];
+            [cons addObject:[b.heightAnchor constraintEqualToConstant:46]];
+            prev = b;
+        }
+        [cons addObject:[prev.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14]];
+        [NSLayoutConstraint activateConstraints:cons];
+
+        w.rootViewController = host;
+        w.hidden = NO;
+        w.alpha = 0;
+        [UIView animateWithDuration:0.22 animations:^{ w.alpha = 1; }];
+    } @catch (NSException *e) {
+        LG(@"!!! showDebugMenu 异常: %@", e.reason);
+    }
+}
+
+- (void)debugActionWrapper:(UIButton *)b {
+    void (^act)(void) = objc_getAssociatedObject(b, "lvcc_debug_act");
+    if (act) act();
+}
+
+- (void)onDebugBgTap:(UITapGestureRecognizer *)g {
+    @try {
+        if (self.debugCardView && CGRectContainsPoint(self.debugCardView.frame, [g locationInView:self.debugCardView.superview])) return;
+        [self closeDebug];
     } @catch (NSException *e) { }
 }
 
@@ -1183,7 +1350,7 @@ static BOOL VCLooksLikeLogin(UIViewController *vc) {
             close.titleLabel.font = [UIFont boldSystemFontOfSize:17];
             close.backgroundColor = [UIColor secondarySystemBackgroundColor];
             close.layer.cornerRadius = 10;
-            [close addTarget:self action:@selector(closeTop) forControlEvents:UIControlEventTouchUpInside];
+            [close addTarget:self action:@selector(showDebugMenu) forControlEvents:UIControlEventTouchUpInside];
             [host.view addSubview:close];
 
             [NSLayoutConstraint activateConstraints:@[
@@ -1203,10 +1370,10 @@ static BOOL VCLooksLikeLogin(UIViewController *vc) {
                 [close.heightAnchor constraintEqualToConstant:46],
                 [close.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12],
             ]];
-            host.modalPresentationStyle = UIModalPresentationFullScreen;
-            UIViewController *vc = [self topVC];
-            if (!vc) { LG(@"!!! showText 找不到 topVC"); return; }
-            [vc presentViewController:host animated:YES completion:nil];
+            UIWindow *w = [self ensureDebugWindow];
+            if (!w) return;
+            w.rootViewController = host;
+            w.hidden = NO; w.alpha = 1;
         } @catch (NSException *e) {
             LG(@"!!! 展示文本失败: %@", e.reason);
         }

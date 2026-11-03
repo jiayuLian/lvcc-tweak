@@ -1,6 +1,6 @@
 Package: com.local.lvcclogin
 Name: LvccLogin
-Version: 0.8.0
+Version: 0.9.1
 Architecture: iphoneos-arm
 Description: phone+password login helper, zero-dependency (no substrate)
 Maintainer: local
