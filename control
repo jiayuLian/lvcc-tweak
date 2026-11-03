@@ -1,0 +1,9 @@
+Package: com.local.lvcclogin
+Name: LvccLogin
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: phone+password login helper
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: mobilesubstrate
