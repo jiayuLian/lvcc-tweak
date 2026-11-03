@@ -23,7 +23,7 @@
 #import <objc/runtime.h>
 #import <unistd.h>
 
-#define BUILD_TAG  @"v0.6.0-arm64-nodep"
+#define BUILD_TAG  @"v0.7.0-arm64-nodep"
 #define LOG_PATH   @"/var/mobile/Library/Caches/lvcc_tweak.log"
 #define KEYS_PATH  @"/var/mobile/Library/Caches/lvcc_token_keys.plist"
 #define API_HOST   @"appapi.lvcchong.com"
@@ -402,14 +402,17 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
 // ---------------- 登录卡 UI ----------------
 
+@class LvccPanel;   // 下方定义，供 onCancel/onDimTap 调用 dismissLogin
+
 @interface LvccLoginVC : UIViewController
-@property (nonatomic, weak)   id panel;
+@property (nonatomic, weak)   LvccPanel *panel;
 @property (nonatomic, strong) UITextField *phoneF;
 @property (nonatomic, strong) UITextField *pwdF;
 @property (nonatomic, strong) UIButton *okBtn;
 @property (nonatomic, strong) UILabel  *errLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *spin;
 @property (nonatomic, strong) UIView  *cardView;
+@property (nonatomic, strong) NSLayoutConstraint *centerYCon;   // 卡片垂直居中约束，键盘弹出时改 constant 上移
 @end
 
 @implementation LvccLoginVC
@@ -484,6 +487,15 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     [cancel setTitle:@"取 消" forState:UIControlStateNormal];
     [cancel addTarget:self action:@selector(onCancel) forControlEvents:UIControlEventTouchUpInside];
 
+    // 右上角 × 关闭按钮（醒目，点它或点暗色背景都能关）
+    UIButton *xbtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    xbtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [xbtn setTitle:@"✕" forState:UIControlStateNormal];
+    xbtn.titleLabel.font = [UIFont systemFontOfSize:24 weight:UIFontWeightBold];
+    [xbtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [xbtn addTarget:self action:@selector(onCancel) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:xbtn];
+
     [card addSubview:self.phoneF];
     self.cardView = card;
     [card addSubview:self.pwdF];
@@ -493,9 +505,10 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
     UILayoutGuide *cg = card.layoutMarginsGuide;
 
+    self.centerYCon = [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor];
     [NSLayoutConstraint activateConstraints:@[
         [card.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
+        self.centerYCon,
         [card.widthAnchor constraintEqualToConstant:cardW],
 
         [header.topAnchor constraintEqualToAnchor:card.topAnchor],
@@ -507,6 +520,12 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
         [title.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16],
         [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:3],
         [sub.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16],
+        [sub.trailingAnchor constraintLessThanOrEqualToAnchor:xbtn.leadingAnchor constant:-8],
+
+        [xbtn.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-10],
+        [xbtn.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [xbtn.widthAnchor constraintEqualToConstant:34],
+        [xbtn.heightAnchor constraintEqualToConstant:34],
 
         [self.phoneF.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:18],
         [self.phoneF.leadingAnchor constraintEqualToAnchor:cg.leadingAnchor],
@@ -537,6 +556,16 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     dispatch_async(dispatch_get_main_queue(), ^{
         gl.frame = header.bounds;
     });
+
+    // 键盘监听：弹起时把卡片整体上移，避免输入框/确定按钮被键盘盖住
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(keyboardWillShow:)
+                                                 name:UIKeyboardWillShowNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(keyboardWillHide:)
+                                                 name:UIKeyboardWillHideNotification
+                                               object:nil];
 }
 
 - (UITextField *)makeField:(NSString *)placeholder secure:(BOOL)secure number:(BOOL)number {
@@ -566,14 +595,45 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     [self.phoneF becomeFirstResponder];
 }
 
+// 键盘弹起：卡片整体上移半个键盘高，使卡片底部落在键盘顶之上
+- (void)keyboardWillShow:(NSNotification *)n {
+    NSDictionary *info = n.userInfo;
+    CGRect fr = [info[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGFloat kbH = fr.size.height;
+    CGFloat dur = [info[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    if (dur <= 0) dur = 0.25;
+    self.centerYCon.constant = -kbH / 2.0;
+    [UIView animateWithDuration:dur
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self.view layoutIfNeeded]; }
+                     completion:nil];
+}
+
+- (void)keyboardWillHide:(NSNotification *)n {
+    NSDictionary *info = n.userInfo;
+    CGFloat dur = [info[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    if (dur <= 0) dur = 0.25;
+    self.centerYCon.constant = 0;
+    [UIView animateWithDuration:dur
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{ [self.view layoutIfNeeded]; }
+                     completion:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
 - (void)onDimTap:(UITapGestureRecognizer *)g {
     CGPoint p = [g locationInView:self.view];
     if (self.cardView && CGRectContainsPoint(self.cardView.frame, p)) return;
-    [self dismissViewControllerAnimated:YES completion:nil];
+    [self.panel dismissLogin];
 }
 
 - (void)onCancel {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    [self.panel dismissLogin];
 }
 
 - (void)onOK {
@@ -680,6 +740,7 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
 @interface LvccPanel : NSObject
 @property (nonatomic, strong) UIWindow *pillWindow;
+@property (nonatomic, strong) UIWindow *loginWindow;   // 承载登录卡的全屏窗口（层级高于胶囊）
 @property (nonatomic, strong) UIButton *pill;
 @property (nonatomic, weak)   UIViewController *hostVC;
 @property (nonatomic, copy)   NSString *lastText;
@@ -687,6 +748,7 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 - (void)installPill;
 - (void)startVisibilityMonitor;
 - (void)copyLastText;
+- (void)dismissLogin;
 @end
 
 @implementation LvccPanel
@@ -879,15 +941,32 @@ static BOOL VCLooksLikeLogin(UIViewController *vc) {
 
 - (void)onPillTap {
     @try {
-        LvccLoginVC *vc = [[LvccLoginVC alloc] init];
-        vc.panel = self;
-        vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
-        UIViewController *host = [self topVC];
-        if (!host) { LG(@"!!! 找不到 topVC，无法弹出登录卡"); return; }
-        [host presentViewController:vc animated:YES completion:nil];
+        if (!self.loginWindow) {
+            UIWindowScene *scene = [self activeScene];
+            UIWindow *w = scene ? [[UIWindow alloc] initWithWindowScene:scene]
+                                : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+            w.windowLevel = UIWindowLevelAlert + 2000;   // 高于胶囊窗口，盖在最上层
+            w.backgroundColor = [UIColor clearColor];
+            LvccLoginVC *lc = [[LvccLoginVC alloc] init];
+            lc.panel = self;
+            w.rootViewController = lc;
+            self.loginWindow = w;
+        }
+        self.loginWindow.hidden = NO;
+        self.loginWindow.alpha = 0;
+        [UIView animateWithDuration:0.25 animations:^{ self.loginWindow.alpha = 1; }];
     } @catch (NSException *e) {
         LG(@"!!! 弹登录卡异常: %@", e.reason);
     }
+}
+
+// 关闭登录卡（点 × 或点暗色背景都走这里）
+- (void)dismissLogin {
+    @try {
+        if (!self.loginWindow) return;
+        [UIView animateWithDuration:0.2 animations:^{ self.loginWindow.alpha = 0; }
+                         completion:^(BOOL f){ self.loginWindow.hidden = YES; }];
+    } @catch (NSException *e) { }
 }
 
 - (void)onPillLong:(UILongPressGestureRecognizer *)g {
