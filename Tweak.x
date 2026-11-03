@@ -8,6 +8,7 @@
 #import <Security/Security.h>
 #import <objc/runtime.h>
 
+#define BUILD_TAG  @"v0.2.0-arm64"
 #define LOG_PATH   @"/var/mobile/Library/Caches/lvcc_tweak.log"
 #define API_HOST   @"appapi.lvcchong.com"
 #define UA_STR     @"Mozilla/5.0 (iPhone; CPU iPhone OS 15_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
@@ -327,14 +328,22 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
 %hookf(OSStatus, SecItemCopyMatching, CFDictionaryRef query, CFTypeRef *result) {
     OSStatus st = %orig;
-    LG(@"[KC.copy] q=%@ -> %d", (__bridge NSDictionary *)query, (int)st);
+    // 限流：App 会高频查 keychain，全量写日志会把文件撑爆、拖慢启动。
+    // 只记前 400 次，且只记 service/account 两个关键字段。
+    static int kcCopyCount = 0;
+    if (__sync_fetch_and_add(&kcCopyCount, 1) < 400) {
+        NSDictionary *q = (__bridge NSDictionary *)query;
+        NSString *svc = q[(__bridge id)kSecAttrService];
+        NSString *acct = q[(__bridge id)kSecAttrAccount];
+        if (svc || acct) LG(@"[KC.copy] svc=%@ acct=%@ -> %d", svc ?: @"-", acct ?: @"-", (int)st);
+    }
     return st;
 }
 
 // ---------- 启动 ----------
 
 %ctor {
-    LG(@"==== LvccLogin 载入 pid=%d ====", getpid());
+    LG(@"==== LvccLogin 载入 build=%@ pid=%d ====", BUILD_TAG, getpid());
     LG(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[LvccPanel shared] installBall];

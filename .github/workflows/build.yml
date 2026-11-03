@@ -24,17 +24,54 @@ jobs:
       - name: Build
         run: |
           make clean || true
-          make FINALPACKAGE=1 ARCHS="arm64 arm64e" 2>&1 | tail -50
+          make FINALPACKAGE=1 ARCHS="arm64" 2>&1 | tail -60
 
-      - name: Collect
+      - name: Collect and verify
         run: |
+          set -e
           mkdir -p out
-          find .theos -name "*.dylib" -type f -exec cp {} out/ \;
-          ls -la out
-          for f in out/*.dylib; do lipo -info "$f" || true; ldid -S "$f" || true; done
+
+          # 关键：排除 *.dSYM 目录。dSYM/Contents/Resources/DWARF/LvccLogin.dylib
+          # 的文件名同样是 LvccLogin.dylib，但 filetype 是 MH_DSYM(10)，
+          # 之前 find -name "*.dylib" 把它一起 cp 进来把真二进制覆盖了，
+          # TrollFools 内置 ldid 拿到 MH_DSYM 就报 Unsupported Mach-O type。
+          BIN=""
+          for c in ".theos/obj/iphoneos.arm64/LvccLogin.dylib" \
+                   ".theos/obj/LvccLogin.dylib" \
+                   ".theos/obj/debug/LvccLogin.dylib"; do
+            if [ -f "$c" ]; then BIN="$c"; break; fi
+          done
+          if [ -z "$BIN" ]; then
+            BIN=$(find .theos -path '*\.dSYM' -prune -o -type f -name 'LvccLogin.dylib' -print | head -1)
+          fi
+          echo "PICKED: $BIN"
+          test -n "$BIN"
+
+          cp "$BIN" out/LvccLogin.dylib
+
+          echo "=== all candidates for reference ==="
+          find .theos -type f -name '*.dylib' -exec sh -c 'echo "$1 -> $(otool -hv "$1" | tail -1 | awk "{print \$5}")"' _ {} \; || true
+
+          echo "=== picked binary header ==="
+          otool -hv out/LvccLogin.dylib
+
+          FT=$(otool -hv out/LvccLogin.dylib | tail -1 | awk '{print $5}')
+          echo "filetype = $FT"
+          # 硬断言：必须是真的动态库
+          if [ "$FT" != "DYLIB" ]; then
+            echo "FATAL: collected file is not MH_DYLIB (got $FT)"
+            exit 1
+          fi
+
+          lipo -info out/LvccLogin.dylib
+          otool -D out/LvccLogin.dylib || true
+          ldid -S out/LvccLogin.dylib
+          echo "=== signature ==="
+          ldid -e out/LvccLogin.dylib | head -c 200 || true
+          ls -la out/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: LvccLogin
-          path: out/*.dylib
+          path: out/LvccLogin.dylib
