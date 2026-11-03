@@ -15,7 +15,7 @@
 #import <objc/runtime.h>
 #import <unistd.h>
 
-#define BUILD_TAG  @"v0.3.0-arm64-nodep"
+#define BUILD_TAG  @"v0.4.0-arm64-nodep"
 #define LOG_PATH   @"/var/mobile/Library/Caches/lvcc_tweak.log"
 #define API_HOST   @"appapi.lvcchong.com"
 #define UA_STR     @"Mozilla/5.0 (iPhone; CPU iPhone OS 15_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
@@ -279,7 +279,7 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     }
 }
 
-// 通用文本展示：可滚动、可全选复制
+// 通用文本展示：用 Auto Layout + 安全区约束，彻底避免硬编码坐标导致的错位/点不到
 - (void)showText:(NSString *)text title:(NSString *)title {
     self.lastText = text;
     @try { UIPasteboard.generalPasteboard.string = text; } @catch (NSException *e) { }
@@ -287,28 +287,29 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             UIViewController *host = [[UIViewController alloc] init];
-            host.view.frame = UIScreen.mainScreen.bounds;
             host.view.backgroundColor = [UIColor systemBackgroundColor];
-            CGRect b = UIScreen.mainScreen.bounds;
+            UILayoutGuide *g = host.view.safeAreaLayoutGuide;
 
-            UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(16, 50, b.size.width - 32, 26)];
+            UILabel *lab = [[UILabel alloc] init];
+            lab.translatesAutoresizingMaskIntoConstraints = NO;
             lab.text = title;
             lab.font = [UIFont boldSystemFontOfSize:17];
-            lab.numberOfLines = 1;
+            lab.numberOfLines = 0;
             [host.view addSubview:lab];
 
-            UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(
-                12, 84, b.size.width - 24, b.size.height - 84 - 130)];
+            UITextView *tv = [[UITextView alloc] init];
+            tv.translatesAutoresizingMaskIntoConstraints = NO;
             tv.text = text;
             tv.editable = NO;
             tv.selectable = YES;
             tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
             tv.backgroundColor = [UIColor secondarySystemBackgroundColor];
             tv.layer.cornerRadius = 8;
+            tv.layoutMargins = UIEdgeInsetsMake(8, 8, 8, 8);
             [host.view addSubview:tv];
 
             UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
-            copy.frame = CGRectMake(16, b.size.height - 118, b.size.width - 32, 46);
+            copy.translatesAutoresizingMaskIntoConstraints = NO;
             [copy setTitle:@"再次复制全部" forState:UIControlStateNormal];
             copy.titleLabel.font = [UIFont boldSystemFontOfSize:17];
             copy.backgroundColor = [UIColor secondarySystemBackgroundColor];
@@ -317,7 +318,7 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
             [host.view addSubview:copy];
 
             UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-            close.frame = CGRectMake(16, b.size.height - 62, b.size.width - 32, 46);
+            close.translatesAutoresizingMaskIntoConstraints = NO;
             [close setTitle:@"关闭" forState:UIControlStateNormal];
             close.titleLabel.font = [UIFont boldSystemFontOfSize:17];
             close.backgroundColor = [UIColor secondarySystemBackgroundColor];
@@ -325,8 +326,31 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
             [close addTarget:self action:@selector(closeTop) forControlEvents:UIControlEventTouchUpInside];
             [host.view addSubview:close];
 
+            [NSLayoutConstraint activateConstraints:@[
+                [lab.topAnchor constraintEqualToAnchor:g.topAnchor constant:16],
+                [lab.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:16],
+                [lab.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-16],
+
+                [tv.topAnchor constraintEqualToAnchor:lab.bottomAnchor constant:12],
+                [tv.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
+                [tv.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
+
+                [copy.topAnchor constraintEqualToAnchor:tv.bottomAnchor constant:12],
+                [copy.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:16],
+                [copy.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-16],
+                [copy.heightAnchor constraintEqualToConstant:46],
+
+                [close.topAnchor constraintEqualToAnchor:copy.bottomAnchor constant:10],
+                [close.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:16],
+                [close.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-16],
+                [close.heightAnchor constraintEqualToConstant:46],
+                [close.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12],
+            ]];
+
             host.modalPresentationStyle = UIModalPresentationFullScreen;
-            [[self topVC] presentViewController:host animated:YES completion:nil];
+            UIViewController *vc = [self topVC];
+            if (!vc) { LG(@"!!! showText 找不到 topVC"); return; }
+            [vc presentViewController:host animated:YES completion:nil];
         } @catch (NSException *e) {
             LG(@"!!! 展示文本失败: %@", e.reason);
         }
@@ -335,7 +359,10 @@ static void PostForm(NSString *path, NSDictionary *form, NSString *token, void (
 
 - (void)closeTop {
     @try {
-        [[self topVC] dismissViewControllerAnimated:YES completion:nil];
+        UIViewController *vc = [self topVC];
+        // 找到当前最上层已 present 的 VC 再 dismiss，避免 dismiss 错对象
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        [vc dismissViewControllerAnimated:YES completion:nil];
     } @catch (NSException *e) { }
 }
 
