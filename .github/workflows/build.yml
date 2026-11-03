@@ -89,3 +89,21 @@ jobs:
         with:
           name: LvccLogin
           path: out/LvccLogin.dylib
+
+      - name: Release (只保留最新一个)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          VER=$(grep '^Version:' control | awk '{print $2}')
+          echo "release version = $VER"
+          # 删除所有现存 release + 对应 tag，保证 releases 页面始终只有一个版本
+          TAGS=$(gh release list --json tagName -q '.[].tagName' || true)
+          for t in $TAGS; do
+            echo "删除旧 release: $t"
+            gh release delete "$t" -y --cleanup-tag || true
+          done
+          gh release create "$VER" out/LvccLogin.dylib \
+            --title "$VER" \
+            --latest \
+            --notes "LvccLogin v$VER（零依赖 dylib）。注入后登录页底部出现橙色「密码登录」胶囊按钮，点按输入手机号+密码即可登录并进入 App。长按胶囊可导出存储/查看日志。"
