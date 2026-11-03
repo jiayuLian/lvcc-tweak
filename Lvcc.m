@@ -199,6 +199,7 @@ static void InstallSetHook(void) {
 }
 
 // 把登录拿到的凭证写回 App 本地存储
+static void WriteUserModelFile(NSDictionary *data);   // 前向声明（定义在下方）
 static void WriteTokens(NSDictionary *data) {
     @try {
         NSString *ut  = [data[@"userToken"]   description] ?: @"";
