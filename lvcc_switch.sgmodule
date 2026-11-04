@@ -1,0 +1,11 @@
+#!name=驴充充小程序换号
+#!desc=微信里点切换链接记号码，重开小程序自动换号。需开启 HTTPS 解密并完全信任根证书。
+#!author=阿岩
+#!category=工具
+
+[MITM]
+hostname = h5.lvcchong.com, appapi.lvcchong.com
+
+[Script]
+lvcc-switch = type=http-request, pattern=^https://h5\.lvcchong\.com/__lvcc_switch__, script-path=https://raw.githubusercontent.com/jiayuLian/lvcc-tweak/main/lvcc_switch_shadowrocket.js, enable=true
+lvcc-login = type=http-request, pattern=^https://appapi\.lvcchong\.com/(getUnionInfo|registerOrLoginUser), script-path=https://raw.githubusercontent.com/jiayuLian/lvcc-tweak/main/lvcc_switch_shadowrocket.js, enable=true
