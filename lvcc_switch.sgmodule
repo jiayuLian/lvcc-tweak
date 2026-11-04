@@ -7,5 +7,5 @@
 hostname = h5.lvcchong.com, appapi.lvcchong.com
 
 [Script]
-lvcc-switch = type=http-request, pattern=^https://h5\.lvcchong\.com/__lvcc_switch__, script-path=https://raw.githubusercontent.com/jiayuLian/lvcc-tweak/main/lvcc_switch_shadowrocket.js, enable=true
-lvcc-login = type=http-request, pattern=^https://appapi\.lvcchong\.com/(getUnionInfo|registerOrLoginUser), script-path=https://raw.githubusercontent.com/jiayuLian/lvcc-tweak/main/lvcc_switch_shadowrocket.js, enable=true
+lvcc-switch = type=http-request, pattern=^https://h5\.lvcchong\.com/__lvcc_switch__, script-path=https://cdn.jsdelivr.net/gh/jiayuLian/lvcc-tweak@main/lvcc_switch_shadowrocket.js, enable=true
+lvcc-login = type=http-request, pattern=^https://appapi\.lvcchong\.com/(getUnionInfo|registerOrLoginUser), script-path=https://cdn.jsdelivr.net/gh/jiayuLian/lvcc-tweak@main/lvcc_switch_shadowrocket.js, enable=true
