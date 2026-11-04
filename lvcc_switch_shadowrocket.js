@@ -26,6 +26,8 @@
  * 只用 ES5 语法，兼容 JavaScriptCore。
  */
 var KEY_MOBILE = 'lvcc_phone_current_mobile';
+var KEY_NOTIFY_AT = 'lvcc_login_notify_at';
+var NOTIFY_GAP_MS = 600000;              // 10 分钟节流：402 刷新会反复触发，避免刷屏
 var BASE = 'https://appapi.lvcchong.com';
 var LOGIN_QUERY = '/registerOrLoginUser?mobile=';
 
@@ -44,6 +46,14 @@ function kvSet(k, v) {
 }
 function notify(title, sub, msg) {
   try { if (typeof $notify !== 'undefined') $notify(title, sub, msg); } catch (e) {}
+}
+// 命中登录接口时给一条可见回执，用来区分「脚本没跑」和「脚本跑了但没换号」
+function notifyLoginHit(mobile) {
+  var now = Date.now();
+  var last = parseInt(kvGet(KEY_NOTIFY_AT), 10) || 0;
+  if (now - last < NOTIFY_GAP_MS) return;
+  kvSet(KEY_NOTIFY_AT, String(now));
+  notify('驴充充换号', '登录请求已改写 → ' + mobile, '若号码未变，删小程序重开或等一次 402 刷新');
 }
 
 function handleRequest() {
@@ -84,6 +94,7 @@ function handleRequest() {
   var out = { url: newUrl };
   if (typeof $request.body !== 'undefined') out.body = $request.body;
   if ($request.headers) out.headers = $request.headers;
+  notifyLoginHit(mobile);
   $done(out);
 }
 
