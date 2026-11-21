@@ -1,28 +1,16 @@
 /*
- * 驴充充小程序 · 纯手机换号（Shadowrocket 版，只改 URL，不改 body）
+ * 驴充充小程序 · 纯手机换号（Shadowrocket 版 v2）
  *
- * 与 lvcc_miniapp_switch.js 的区别：本脚本不改 body / headers / method，
- * 只在 request 阶段把 /getUnionInfo 的 URL 换成带完整参数的 /registerOrLoginUser。
- * 因此 Shadowrocket 配置里不需要 requires-body=1，兼容性最好。
+ * 只改 URL，不改 body / headers / method。
+ * 把 /getUnionInfo 换成带完整参数的 /registerOrLoginUser。
  *
- * 实测依据（_wxapkg/probe_query_param.js，全部走快代理真实打接口）：
- *   POST /registerOrLoginUser?mobile=xxx&ownerId=0&entryType=5
- *        &registerOrBind=1&validateType=3&checkDataValue=
- *   + 空 body                        -> code=200，签出 userToken/refreshToken/userId
- *   + 原始 getUnionInfo form body     -> code=200（body 被忽略）
- *   + JSON body / application/json   -> code=200
- *   GET 同 URL                       -> Tomcat 405，所以必须保持原 POST 方法不动
- *   换不同手机号 -> userId 不同 / code=1017，证明 query 里的 mobile 被服务端真实读取
- *   手机号不存在 -> code=1017「请使用短信验证码进行注册！」，不会建号
+ * v2 新增：支持 ?mobile=off 清除号码（v1 只认 1 开头的 11 位，输 off 会被忽略）
  *
- * 换号流程（全在手机）：
+ * 换号流程：
  *   1) 微信里点收藏的 https://h5.lvcchong.com/__lvcc_switch__?mobile=目标手机号
- *      -> 本脚本记住号码并弹一条通知（页面 404 无所谓）
- *   2) 重开驴充充小程序，随便点一页（或等 30 秒）
- *      -> 短票 402 -> reshToken() 打 POST /getUnionInfo -> URL 被本脚本改掉
- *      -> 服务端按 URL 里的 mobile 签票，小程序照常覆盖三键
+ *   2) 重开小程序（建议先删掉再进），点任意页面
+ *   恢复：把上面的手机号换成 off
  *
- * 依赖：Shadowrocket / Stash / Surge 的 $persistentStore，QX 的 $prefs（两者都兼容）
  * 只用 ES5 语法，兼容 JavaScriptCore。
  */
 var KEY_MOBILE = 'lvcc_phone_current_mobile';
@@ -59,7 +47,7 @@ function notifyLoginHit(mobile) {
 function handleRequest() {
   var url = $request.url || '';
 
-  // 切换端点：只记号码，原样放行（服务器返回 404 不影响）
+  // 切换端点：记号码 / 清除，原样放行（服务器返回 404 不影响）
   if (/lvcchong/i.test(url) && url.indexOf('/__lvcc_switch__') >= 0) {
     var m = url.match(/[?&]mobile=([^&#]*)/);
     var num = '';
@@ -69,6 +57,9 @@ function handleRequest() {
     if (/^1\d{10}$/.test(num)) {
       kvSet(KEY_MOBILE, num);
       notify('驴充充换号', '已切换到 ' + num, '重开小程序，点一下页面即生效');
+    } else if (num === 'off' || num === '0') {
+      kvSet(KEY_MOBILE, '');
+      notify('驴充充换号', '已清除', '下次小程序登录恢复为微信原始账号');
     }
     $done({});
     return;
@@ -81,7 +72,7 @@ function handleRequest() {
   }
   var mobile = kvGet(KEY_MOBILE);
   if (!/^1\d{10}$/.test(mobile)) {
-    $done({});                       // 没设过号 = 保持小程序原来的微信登录
+    $done({});                       // 没设号 = 保持小程序原来的微信登录
     return;
   }
 
